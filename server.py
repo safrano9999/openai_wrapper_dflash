@@ -21,9 +21,11 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 from dflash.model_mlx import load, load_draft, stream_generate
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH = "mlx-community/Qwen3.5-4B-4bit"
-DRAFT_ID   = "z-lab/Qwen3.5-4B-DFlash"
-MODEL_ID   = "qwen3.5-4b-dflash"
+MODEL_PATH      = "mlx-community/Qwen3.5-4B-4bit"
+DRAFT_ID        = "z-lab/Qwen3.5-4B-DFlash"
+MODEL_ID        = "qwen3.5-4b-dflash"
+MAX_PROMPT_TOKENS = 2048   # hard limit — larger prompts cause Metal GPU timeout on 8GB
+DEFAULT_BLOCK_SIZE = 4     # smaller = less GPU work per step, more stable
 
 
 def _is_cached(repo_id: str) -> bool:
@@ -150,7 +152,7 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = 512
     temperature: Optional[float] = 0.0
     stream: Optional[bool] = True
-    block_size: Optional[int] = None  # DFlash-specific
+    block_size: Optional[int] = DEFAULT_BLOCK_SIZE  # DFlash-specific
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -226,9 +228,16 @@ async def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
     prompt = apply_chat_template(req.messages)
+    prompt_tokens = len(prompt) // 4
     request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
-    print(f"[{request_id}] prompt tokens≈{len(prompt)//4} | queue depth: {queue.qsize()}")
+    if prompt_tokens > MAX_PROMPT_TOKENS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt too long ({prompt_tokens} tokens estimated). Limit is {MAX_PROMPT_TOKENS} to avoid GPU timeout."
+        )
+
+    print(f"[{request_id}] prompt tokens≈{prompt_tokens} | queue depth: {queue.qsize()}")
 
     if req.stream:
         return StreamingResponse(
