@@ -1,0 +1,13 @@
+[model]
+path           = "mlx-community/Qwen3.5-4B-4bit"
+draft_id       = "z-lab/Qwen3.5-4B-DFlash"
+id             = "qwen3.5-4b-dflash"
+context_length = 32768
+
+[inference]
+max_prompt_tokens  = 8192
+default_block_size = 4      # smaller = less GPU work per step, more stable
+
+[server]
+host = "127.0.0.1"
+port = 8080

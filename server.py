@@ -1,13 +1,15 @@
 """
 DFlash MLX Server — OpenAI-compatible API with request queue
-Usage: python server.py [--port 8080]
+Usage: python server.py [--port 8080] [--config config.toml]
 """
 import argparse
 import asyncio
 import json
 import time
+import tomllib
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import uvicorn
@@ -20,12 +22,18 @@ from huggingface_hub import snapshot_download
 from huggingface_hub.utils import LocalEntryNotFoundError
 from dflash.model_mlx import load, load_draft, stream_generate
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH      = "mlx-community/Qwen3.5-4B-4bit"
-DRAFT_ID        = "z-lab/Qwen3.5-4B-DFlash"
-MODEL_ID        = "qwen3.5-4b-dflash"
-MAX_PROMPT_TOKENS = 2048   # hard limit — larger prompts cause Metal GPU timeout on 8GB
-DEFAULT_BLOCK_SIZE = 4     # smaller = less GPU work per step, more stable
+
+def _load_config(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p, "rb") as f:
+        return tomllib.load(f)
+
+
+# Config is parsed at startup after argparse runs; placeholders here.
+MODEL_PATH = DRAFT_ID = MODEL_ID = None
+CONTEXT_LENGTH = MAX_PROMPT_TOKENS = DEFAULT_BLOCK_SIZE = None
 
 
 def _is_cached(repo_id: str) -> bool:
@@ -120,6 +128,7 @@ async def queue_worker():
                 prompt, max_tokens, temperature, block_size, chunk_queue,
             )
         except Exception as e:
+            print(f"  [ERROR] {e}", flush=True)
             await chunk_queue.put(("error", str(e)))
         finally:
             queue.task_done()
@@ -128,6 +137,9 @@ async def queue_worker():
 def _run_inference(prompt, max_tokens, temperature, block_size, chunk_queue):
     """Runs synchronously in a thread pool executor."""
     loop = asyncio.new_event_loop()
+    t0 = time.perf_counter()
+    token_count = 0
+    last_print = t0
     try:
         for resp in stream_generate(
             model, draft, tokenizer, prompt,
@@ -136,9 +148,26 @@ def _run_inference(prompt, max_tokens, temperature, block_size, chunk_queue):
             temperature=temperature,
         ):
             loop.run_until_complete(chunk_queue.put(("chunk", resp)))
+            token_count += 1
+            now = time.perf_counter()
+            if now - last_print >= 2.0:
+                tps = token_count / (now - t0)
+                print(f"  ... {token_count} tokens | {tps:.1f} tok/s", flush=True)
+                last_print = now
+        elapsed = time.perf_counter() - t0
+        tps = token_count / elapsed if elapsed > 0 else 0
+        print(f"  done: {token_count} tokens | {tps:.1f} tok/s | {elapsed:.1f}s", flush=True)
         loop.run_until_complete(chunk_queue.put(("done", None)))
     finally:
         loop.close()
+
+
+import re as _re
+
+def _clean(text: str) -> str:
+    text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL)
+    text = text.replace("<|im_end|>", "").strip()
+    return text
 
 
 # ── Request / Response schemas ────────────────────────────────────────────────
@@ -194,18 +223,33 @@ async def stream_response(
         print(f"[queue] enqueued | {qsize_before} ahead in queue")
     await queue.put((prompt, max_tokens, temperature, block_size, chunk_queue))
 
+    buffer = ""
+    in_think = False
     while True:
         kind, data = await chunk_queue.get()
         if kind == "error":
             yield f"data: {{\"error\": \"{data}\"}}\n\n"
             break
         if kind == "done":
+            tail = _clean(buffer)
+            if tail:
+                yield sse_chunk(tail, request_id)
             yield sse_chunk("", request_id, finish_reason="stop")
             yield "data: [DONE]\n\n"
             break
-        if kind == "chunk":
-            if data.text:
-                yield sse_chunk(data.text, request_id)
+        if kind == "chunk" and data.text:
+            buffer += data.text
+            if "<think>" in buffer:
+                in_think = True
+            if in_think:
+                if "</think>" in buffer:
+                    buffer = buffer.split("</think>", 1)[1]
+                    in_think = False
+                continue
+            out = buffer.replace("<|im_end|>", "")
+            if out and not out.endswith("<"):
+                yield sse_chunk(out, request_id)
+                buffer = ""
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -218,6 +262,7 @@ def list_models():
             "object": "model",
             "created": int(time.time()),
             "owned_by": "local",
+            "context_length": CONTEXT_LENGTH,
         }]
     }
 
@@ -231,7 +276,7 @@ async def chat_completions(req: ChatRequest):
     prompt_tokens = len(prompt) // 4
     request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
-    if prompt_tokens > MAX_PROMPT_TOKENS:
+    if MAX_PROMPT_TOKENS is not None and prompt_tokens > MAX_PROMPT_TOKENS:
         raise HTTPException(
             status_code=400,
             detail=f"Prompt too long ({prompt_tokens} tokens estimated). Limit is {MAX_PROMPT_TOKENS} to avoid GPU timeout."
@@ -262,7 +307,7 @@ async def chat_completions(req: ChatRequest):
             "model": MODEL_ID,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": full_text},
+                "message": {"role": "assistant", "content": _clean(full_text)},
                 "finish_reason": "stop",
             }],
         }
@@ -276,9 +321,27 @@ def health():
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--host", type=str, default=None)
     args = parser.parse_args()
 
-    print(f"Starting DFlash MLX Server on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    cfg = _load_config("config.toml")
+
+    MODEL_PATH         = cfg.get("model", {}).get("path",           "mlx-community/Qwen3.5-4B-4bit")
+    DRAFT_ID           = cfg.get("model", {}).get("draft_id",       "z-lab/Qwen3.5-4B-DFlash")
+    MODEL_ID           = cfg.get("model", {}).get("id",             "qwen3.5-4b-dflash")
+    CONTEXT_LENGTH     = cfg.get("model", {}).get("context_length", 32768)
+    MAX_PROMPT_TOKENS  = cfg.get("inference", {}).get("max_prompt_tokens",  None)
+    DEFAULT_BLOCK_SIZE = cfg.get("inference", {}).get("default_block_size", 4)
+    host = args.host or cfg.get("server", {}).get("host", "127.0.0.1")
+    port = args.port or cfg.get("server", {}).get("port", 8080)
+
+    import sys
+    _mod = sys.modules[__name__]
+    for _k, _v in [("MODEL_PATH", MODEL_PATH), ("DRAFT_ID", DRAFT_ID), ("MODEL_ID", MODEL_ID),
+                   ("CONTEXT_LENGTH", CONTEXT_LENGTH), ("MAX_PROMPT_TOKENS", MAX_PROMPT_TOKENS),
+                   ("DEFAULT_BLOCK_SIZE", DEFAULT_BLOCK_SIZE)]:
+        setattr(_mod, _k, _v)
+
+    print(f"Starting DFlash MLX Server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
